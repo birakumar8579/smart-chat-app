@@ -1,18 +1,28 @@
 {
-  "name": "cursor-chat-app",
+  "name": "server",
   "version": "1.0.0",
-  "description": "Full-stack chat application with stories",
-  "private": true,
+  "description": "",
+  "type": "module",
+  "main": "server.js",
   "scripts": {
-    "dev": "concurrently \"npm run server\" \"npm run client\"",
-    "server": "cd server && npm run dev",
-    "client": "cd client && npm run dev",
-    "install-all": "npm install && cd server && npm install && cd ../client && npm install"
+    "dev": "nodemon server.js",
+    "start": "node server.js",
+    "test": "echo \"No tests configured\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.4.1",
+    "multer": "^2.1.1",
+    "socket.io": "^4.8.3"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
-  },
-  "keywords": ["chat", "stories", "react", "node", "mongodb"],
-  "author": "",
-  "license": "ISC"
+    "nodemon": "^3.1.14"
+  }
 }
