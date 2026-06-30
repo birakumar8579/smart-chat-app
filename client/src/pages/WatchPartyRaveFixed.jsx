@@ -1,0 +1,968 @@
+import { useEffect, useRef, useState, useCallback } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import { useAuth } from "../context/AuthContext";
+import api from "../services/api";
+import socket from "../services/socket";
+import { searchYouTube } from "../services/youtube";
+
+export default function WatchPartyRaveFixed() {
+  const { user } = useAuth();
+  const { roomId } = useParams();
+  const navigate = useNavigate();
+  
+  const [watchParty, setWatchParty] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [isHost, setIsHost] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [participants, setParticipants] = useState([]);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [showSearchModal, setShowSearchModal] = useState(false);
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [showPrivacyModal, setShowPrivacyModal] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [selectedVideo, setSelectedVideo] = useState(null);
+  const [joinRoomId, setJoinRoomId] = useState("");
+  const [isPublic, setIsPublic] = useState(true);
+  const [volume, setVolume] = useState(1);
+  const [isMuted, setIsMuted] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  
+  const videoRef = useRef(null);
+  const chatEndRef = useRef(null);
+  const chatContainerRef = useRef(null);
+  const iframeRef = useRef(null);
+
+  // Socket event handlers (moved to top level)
+  const onChatMessage = useCallback((data) => {
+    console.log("[watchparty] Received chat message:", data);
+    if (data.roomId === roomId) {
+      setChatMessages(prev => [...prev, data.message]);
+    }
+  }, [roomId]);
+
+  const onUserJoined = useCallback((data) => {
+    if (data.roomId === roomId) {
+      console.log("[watchparty] User joined:", data.participant);
+      setParticipants(prev => {
+        const exists = prev.some(p => p.user._id === data.participant.user._id);
+        if (!exists) {
+          return [...prev, data.participant];
+        }
+        return prev;
+      });
+    }
+  }, [roomId]);
+
+  const onUserLeft = useCallback((data) => {
+    if (data.roomId === roomId) {
+      console.log("[watchparty] User left:", data.userId);
+      setParticipants(prev => prev.filter(p => p.user._id !== data.userId));
+    }
+  }, [roomId]);
+
+  const onPrivacyUpdated = useCallback((data) => {
+    if (data.roomId === roomId) {
+      setIsPublic(data.isPublic);
+    }
+  }, [roomId]);
+
+  // Load watch party data
+  useEffect(() => {
+    if (roomId) {
+      loadWatchParty(roomId);
+    } else {
+      setLoading(false);
+    }
+  }, [roomId]);
+
+  // Auto-scroll chat and scroll management
+  useEffect(() => {
+    // Auto-scroll to bottom when new messages arrive
+    if (chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [chatMessages]);
+
+  // Handle scroll behavior for new messages
+  const scrollToBottom = () => {
+    if (chatContainerRef.current) {
+      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+    }
+  };
+
+  const loadWatchParty = async (roomId) => {
+    try {
+      setLoading(true);
+      const { data } = await api.get(`/watchparty/${roomId}`);
+      setWatchParty(data.watchParty);
+      
+      // Ensure participants array is properly loaded
+      const loadedParticipants = data.watchParty.participants || [];
+      console.log("[watchparty] Loaded participants:", loadedParticipants.length);
+      
+      // Check if current user is in participants list
+      const currentUserInParticipants = loadedParticipants.some(p => p.user._id === user._id);
+      
+      if (!currentUserInParticipants && data.watchParty.host._id === user._id) {
+        // If user is host but not in participants, add them
+        const hostParticipant = {
+          user: data.watchParty.host,
+          joinedAt: data.watchParty.createdAt || new Date().toISOString(),
+          isActive: true
+        };
+        setParticipants([hostParticipant, ...loadedParticipants]);
+      } else {
+        setParticipants(loadedParticipants);
+      }
+      
+      setChatMessages(data.watchParty.chatMessages || []);
+      setIsPlaying(data.watchParty.isPlaying);
+      setCurrentTime(data.watchParty.currentTime);
+      setIsPublic(data.watchParty.isPublic);
+      setIsHost(data.watchParty.host._id === user._id);
+      
+      console.log("[watchparty] Loaded chat messages:", data.watchParty.chatMessages?.length || 0);
+      
+      // Join socket room
+      if (socket.connected) {
+        console.log("[watchparty] Socket connected, joining room:", roomId, "userId:", user._id);
+        socket.emit("join-watch-party", { roomId, userId: user._id }, (res) => {
+          if (!res?.ok) {
+            console.error("[watchparty] Failed to join room:", res?.error);
+            setError(res?.error || "Failed to join room");
+          } else {
+            console.log("[watchparty] Successfully joined room:", roomId);
+            console.log("[watchparty] Participants in room:", res.participants?.length || 0);
+            console.log("[watchparty] Socket room list:", socket.rooms);
+            // Update participants list with server response
+            if (res.participants) {
+              setParticipants(res.participants);
+            }
+          }
+        });
+      } else {
+        console.error("[watchparty] Socket not connected, cannot join room");
+        setError("Connection lost. Please refresh the page.");
+      }
+    } catch (err) {
+      console.error("[watchparty] Load failed:", err);
+      setError("Watch party not found");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Socket event listeners
+  useEffect(() => {
+    if (!roomId || !socket.connected) return;
+
+    const onPlay = (data) => {
+      if (data.roomId === roomId && iframeRef.current) {
+        const message = JSON.stringify({
+          event: 'command',
+          func: 'playVideo',
+          args: []
+        });
+        iframeRef.current.contentWindow.postMessage(message, '*');
+        setIsPlaying(true);
+        setCurrentTime(data.currentTime);
+      }
+    };
+
+    const onPause = (data) => {
+      if (data.roomId === roomId && iframeRef.current) {
+        const message = JSON.stringify({
+          event: 'command',
+          func: 'pauseVideo',
+          args: []
+        });
+        iframeRef.current.contentWindow.postMessage(message, '*');
+        setIsPlaying(false);
+        setCurrentTime(data.currentTime);
+      }
+    };
+
+    const onSeek = (data) => {
+      if (data.roomId === roomId && iframeRef.current) {
+        const message = JSON.stringify({
+          event: 'command',
+          func: 'seekTo',
+          args: [data.currentTime, true]
+        });
+        iframeRef.current.contentWindow.postMessage(message, '*');
+        setCurrentTime(data.currentTime);
+      }
+    };
+
+    
+    socket.on("play", onPlay);
+    socket.on("pause", onPause);
+    socket.on("seek", onSeek);
+    socket.on("chat-message", onChatMessage);
+    socket.on("participant-joined", onUserJoined);
+    socket.on("user-left", onUserLeft);
+    socket.on("privacy-updated", onPrivacyUpdated);
+
+    return () => {
+      socket.off("play", onPlay);
+      socket.off("pause", onPause);
+      socket.off("seek", onSeek);
+      socket.off("chat-message", onChatMessage);
+      socket.off("participant-joined", onUserJoined);
+      socket.off("user-left", onUserLeft);
+      socket.off("privacy-updated", onPrivacyUpdated);
+      
+      if (roomId) {
+        socket.emit("watch-party-leave", { roomId });
+      }
+    };
+  }, [roomId, user._id, onChatMessage, onUserJoined, onUserLeft, onPrivacyUpdated]);
+
+  // YouTube search
+  const handleSearch = async () => {
+    if (!searchQuery.trim()) {
+      setError("Please enter a search query");
+      setTimeout(() => setError(""), 3000);
+      return;
+    }
+
+    try {
+      setSearching(true);
+      setError("");
+      const results = await searchYouTube(searchQuery.trim());
+      setSearchResults(results);
+      console.log("[youtube] Search completed:", results.length, "videos found");
+      
+      if (results.length === 0) {
+        setError("No videos found. Try different keywords.");
+        setTimeout(() => setError(""), 3000);
+      }
+    } catch (err) {
+      console.error("[youtube] Search failed:", err);
+      setError(err.message || "Failed to search YouTube. Please try again.");
+      setTimeout(() => setError(""), 5000);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  // Create watch party
+  const handleCreateRoom = async () => {
+    if (!selectedVideo) {
+      setError("Please select a video");
+      return;
+    }
+
+    try {
+      const { data } = await api.post("/watchparty/create", {
+        videoUrl: selectedVideo.embedUrl,
+        videoTitle: selectedVideo.title,
+        isPublic,
+      });
+      
+      navigate(`/rave/${data.watchParty.roomId}`);
+      setShowSearchModal(false);
+      setSelectedVideo(null);
+      setSearchResults([]);
+      setSearchQuery("");
+    } catch (err) {
+      console.error("[watchparty] Create failed:", err);
+      setError(err.response?.data?.message || "Failed to create watch party");
+    }
+  };
+
+  // Send chat message - optimized for speed
+  const handleSendMessage = useCallback(() => {
+    const message = chatInput.trim();
+    if (!message || !roomId) {
+      setError("Cannot send empty message");
+      setTimeout(() => setError(""), 2000);
+      return;
+    }
+
+    console.log("[watchparty] Sending message:", message);
+    
+    // Clear input immediately for faster UX
+    setChatInput("");
+    
+    socket.emit("watch-party-chat-message", {
+      roomId,
+      message,
+    }, (res) => {
+      if (!res?.ok) {
+        console.error("[watchparty] Chat failed:", res?.error);
+        setError(res?.error || "Failed to send message");
+        setTimeout(() => setError(""), 3000);
+      } else {
+        console.log("[watchparty] Message sent successfully");
+      }
+    });
+  }, [chatInput, roomId]);
+
+  // Leave party
+  const handleLeaveParty = () => {
+    if (roomId) {
+      socket.emit("watch-party-leave", { roomId });
+      navigate("/rave");
+    }
+  };
+
+  // Copy invite link
+  const handleCopyInvite = () => {
+    const inviteLink = `${window.location.origin}/rave/${roomId}`;
+    navigator.clipboard.writeText(inviteLink).then(() => {
+      setError("Invite link copied!");
+      setTimeout(() => setError(""), 2000);
+    }).catch(err => {
+      console.error("Failed to copy link:", err);
+      setError("Failed to copy link");
+    });
+  };
+
+  // Copy room code
+  const handleCopyRoomCode = () => {
+    navigator.clipboard.writeText(roomId).then(() => {
+      setError("Room code copied!");
+      setTimeout(() => setError(""), 2000);
+    }).catch(err => {
+      console.error("Failed to copy room code:", err);
+      setError("Failed to copy room code");
+    });
+  };
+
+  // Share functions
+  const handleWhatsAppShare = () => {
+    const text = `Join my RAVE party: ${window.location.origin}/rave/${roomId}`;
+    const url = `https://wa.me/?text=${encodeURIComponent(text)}`;
+    window.open(url, '_blank', 'width=600,height=400');
+  };
+
+  const handleTelegramShare = () => {
+    const text = `Join my RAVE party: ${window.location.origin}/rave/${roomId}`;
+    const url = `https://t.me/share/url?url=${encodeURIComponent(text)}`;
+    window.open(url, '_blank', 'width=600,height=400');
+  };
+
+  // Update privacy
+  const handleUpdatePrivacy = () => {
+    if (!isHost) {
+      setError("Only host can change privacy settings");
+      return;
+    }
+    
+    const newPrivacy = !isPublic;
+    console.log("[watchparty] Updating privacy to:", newPrivacy);
+    
+    socket.emit("watch-party-update-privacy", {
+      roomId,
+      isPublic: newPrivacy,
+    }, (res) => {
+      if (!res?.ok) {
+        console.error("[watchparty] Privacy update failed:", res?.error);
+        setError(res?.error || "Failed to update privacy");
+      } else {
+        console.log("[watchparty] Privacy updated successfully");
+        setIsPublic(newPrivacy);
+        setShowPrivacyModal(false);
+        setError(`Room is now ${newPrivacy ? 'Public' : 'Private'}`);
+        setTimeout(() => setError(""), 2000);
+      }
+    });
+  };
+
+  // Format time
+  const formatTime = (time) => {
+    if (!time || isNaN(time)) return "0:00";
+    
+    const minutes = Math.floor(time / 60);
+    const seconds = Math.floor(time % 60);
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  };
+
+  if (loading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gradient-to-br from-purple-900 via-pink-900 to-red-900">
+        <div className="flex items-center gap-3 text-white">
+          <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
+          <span className="text-sm">Loading watch party...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!roomId) {
+    // Landing page
+    return (
+      <div className="flex h-screen bg-gradient-to-br from-purple-900 via-pink-900 to-red-900 p-6">
+        <div className="w-full max-w-md">
+          <div className="text-center mb-8">
+            <h1 className="text-4xl font-bold text-white mb-4">
+              RAVE PARTY
+            </h1>
+            <p className="text-pink-200">Watch videos together with friends</p>
+          </div>
+
+          {error && (
+            <div className="mb-6 rounded-2xl bg-red-500/20 px-5 py-4 text-sm text-red-200 border border-red-400/30">
+              {error}
+            </div>
+          )}
+
+          <div className="space-y-4">
+            <button
+              onClick={() => setShowSearchModal(true)}
+              className="w-full rounded-2xl bg-gradient-to-r from-pink-600 via-red-600 to-purple-600 py-4 font-semibold text-white shadow-lg transition-all hover:from-pink-500 hover:via-red-500 hover:to-purple-500 hover:shadow-xl hover:scale-[1.02] active:scale-[0.98]"
+            >
+              Search YouTube
+            </button>
+            
+            <div className="relative">
+              <input
+                type="text"
+                value={joinRoomId}
+                onChange={(e) => setJoinRoomId(e.target.value.toUpperCase())}
+                placeholder="Enter room code"
+                className="w-full rounded-2xl border border-white/20 bg-white/10 px-5 py-4 text-white placeholder-white/50 outline-none ring-pink-500/30 transition-all focus:ring-2 focus:shadow-lg backdrop-blur-sm"
+              />
+              <button
+                onClick={() => {
+                  if (joinRoomId.trim()) {
+                    navigate(`/rave/${joinRoomId.trim()}`);
+                  }
+                }}
+                disabled={!joinRoomId.trim()}
+                className="absolute right-2 top-1/2 -translate-y-1/2 rounded-xl bg-gradient-to-r from-pink-600 to-purple-600 px-4 py-2 text-xs font-semibold text-white transition-all hover:from-pink-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Join
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-8 text-center">
+            <button
+              onClick={() => navigate("/")}
+              className="text-sm text-pink-200 hover:text-white transition-colors"
+            >
+              Back to Chat
+            </button>
+          </div>
+        </div>
+
+        {/* YouTube Search Modal */}
+        {showSearchModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-2xl max-h-[80vh] overflow-y-auto rounded-3xl bg-white p-8 shadow-2xl">
+              <h2 className="text-2xl font-bold text-slate-900 mb-6">Search YouTube</h2>
+              
+              <div className="space-y-4 mb-6">
+                <div className="flex gap-3">
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Search for videos..."
+                    className="flex-1 rounded-2xl border border-slate-200/60 px-5 py-4 text-slate-900 outline-none ring-pink-500/30 transition-all focus:ring-2 focus:shadow-lg bg-slate-50/50"
+                    onKeyPress={(e) => {
+                      if (e.key === 'Enter') {
+                        handleSearch();
+                      }
+                    }}
+                  />
+                  <button
+                    onClick={handleSearch}
+                    disabled={searching || !searchQuery.trim()}
+                    className="rounded-2xl bg-gradient-to-r from-pink-600 via-red-600 to-purple-600 px-6 py-4 font-semibold text-white shadow-lg transition-all hover:from-pink-500 hover:via-red-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {searching ? (
+                      <div className="flex items-center gap-2">
+                        <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
+                        <span>Searching...</span>
+                      </div>
+                    ) : (
+                      "Search"
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* Search Results */}
+              {searchResults.length > 0 && (
+                <div className="space-y-3 max-h-60 overflow-y-auto border-t border-slate-200 pt-4">
+                  {searchResults.map((video) => (
+                    <div
+                      key={video.videoId}
+                      onClick={() => setSelectedVideo(video)}
+                      className={`flex gap-4 p-4 rounded-xl cursor-pointer transition-all hover:bg-slate-50 ${
+                        selectedVideo?.videoId === video.videoId ? 'bg-pink-50 ring-2 ring-pink-200' : 'border border-slate-200'
+                      }`}
+                    >
+                      <img
+                        src={video.thumbnail}
+                        alt={video.title}
+                        className="h-20 w-28 rounded-lg object-cover"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <h3 className="font-semibold text-slate-900 truncate">{video.title}</h3>
+                        <p className="text-sm text-slate-600 truncate">{video.channelTitle}</p>
+                        <p className="text-xs text-slate-500">
+                          {new Date(video.publishedAt).toLocaleDateString()}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="mt-6 flex gap-3">
+                <button
+                  onClick={() => {
+                    setShowSearchModal(false);
+                    setSearchResults([]);
+                    setSelectedVideo(null);
+                    setSearchQuery("");
+                  }}
+                  className="flex-1 rounded-2xl border border-slate-200/60 py-3 font-semibold text-slate-600 transition-all hover:bg-slate-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleCreateRoom}
+                  disabled={!selectedVideo}
+                  className="flex-1 rounded-2xl bg-gradient-to-r from-pink-600 via-red-600 to-purple-600 py-3 font-semibold text-white shadow-lg transition-all hover:from-pink-500 hover:via-red-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Create Room with {selectedVideo ? 'Selected Video' : 'No Video'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Watch party room view - RAVE style
+  return (
+    <div className="flex h-screen bg-gradient-to-br from-purple-900 via-pink-900 to-red-900">
+      {/* Mobile Header */}
+      <header className="flex items-center justify-between border-b border-white/10 bg-black/20 px-4 py-3 md:hidden">
+        <button
+          onClick={() => navigate("/")}
+          className="rounded-lg bg-white/10 px-3 py-2 text-white text-sm"
+        >
+          Back
+        </button>
+        <h1 className="text-lg font-bold text-white">RAVE PARTY</h1>
+        <button
+          onClick={() => setShowInviteModal(true)}
+          className="rounded-lg bg-white/10 px-3 py-2 text-white text-sm"
+        >
+          Invite
+        </button>
+      </header>
+
+      <div className="flex-1 flex">
+        {/* Main Content - Video Player */}
+        <div className="flex-1 flex flex-col">
+          {/* Desktop Header */}
+          <header className="hidden md:flex items-center justify-between border-b border-white/10 bg-black/20 px-6 py-4">
+            <div className="flex items-center gap-4">
+              <button
+                onClick={() => navigate("/")}
+                className="rounded-xl bg-white/10 px-4 py-2 text-sm font-semibold text-white transition-all hover:bg-white/20"
+              >
+                Back to Chat
+              </button>
+              <div>
+                <h1 className="text-xl font-bold text-white">RAVE PARTY</h1>
+                <p className="text-sm text-pink-200">Room: {roomId}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setShowInviteModal(true)}
+                className="rounded-xl bg-gradient-to-r from-pink-600 to-purple-600 px-4 py-2 text-xs font-semibold text-white transition-all hover:from-pink-500 hover:to-purple-500"
+              >
+                Invite Friends
+              </button>
+              <button
+                onClick={() => setShowPrivacyModal(true)}
+                className="rounded-xl bg-white/10 px-4 py-2 text-xs font-semibold text-white transition-all hover:bg-white/20"
+              >
+                {isPublic ? 'Public' : 'Private'}
+              </button>
+              {isHost && (
+                <button
+                  onClick={handleLeaveParty}
+                  className="rounded-xl bg-red-600/80 px-4 py-2 text-xs font-semibold text-white transition-all hover:bg-red-500"
+                >
+                  Leave Party
+                </button>
+              )}
+            </div>
+          </header>
+
+          {/* Video Player */}
+          <div className="flex-1 flex items-center justify-center p-4">
+            <div className="w-full max-w-4xl">
+              {watchParty ? (
+                <div className="relative rounded-2xl overflow-hidden bg-black shadow-2xl">
+                  <iframe
+                    ref={iframeRef}
+                    src={`${watchParty.videoUrl}?enablejsapi=1&controls=1&modestbranding=1&rel=0`}
+                    className="w-full aspect-video"
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                    allowFullScreen
+                    frameBorder="0"
+                    onLoad={() => {
+                      if (iframeRef.current && isHost) {
+                        setTimeout(() => {
+                          const message = JSON.stringify({
+                            event: 'listening',
+                            id: 'youtubePlayer',
+                            channel: 'widget'
+                          });
+                          iframeRef.current.contentWindow.postMessage(message, '*');
+                        }, 1000);
+                      }
+                    }}
+                  />
+                  
+                  {/* Controls Overlay */}
+                  <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent p-4">
+                    <div className="flex items-center justify-between text-white">
+                      <div className="flex items-center gap-4">
+                        {isHost && (
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => socket.emit("watch-party-play", { roomId })}
+                              className="rounded-full bg-green-600/80 p-3 text-sm transition-all hover:bg-green-500"
+                            >
+                              Play
+                            </button>
+                            <button
+                              onClick={() => socket.emit("watch-party-pause", { roomId })}
+                              className="rounded-full bg-red-600/80 p-3 text-sm transition-all hover:bg-red-500"
+                            >
+                              Pause
+                            </button>
+                            <button
+                              onClick={() => socket.emit("watch-party-seek", { roomId, currentTime: currentTime + 10 })}
+                              className="rounded-full bg-blue-600/80 px-3 py-2 text-sm transition-all hover:bg-blue-500"
+                            >
+                              +10s
+                            </button>
+                            <button
+                              onClick={() => socket.emit("watch-party-seek", { roomId, currentTime: Math.max(0, currentTime - 10) })}
+                              className="rounded-full bg-blue-600/80 px-3 py-2 text-sm transition-all hover:bg-blue-500"
+                            >
+                              -10s
+                            </button>
+                          </div>
+                        )}
+                        <button
+                          onClick={() => {
+                            if (iframeRef.current) {
+                              const message = JSON.stringify({
+                                event: 'command',
+                                func: isMuted ? 'unMute' : 'mute',
+                                args: []
+                              });
+                              iframeRef.current.contentWindow.postMessage(message, '*');
+                              setIsMuted(!isMuted);
+                            }
+                          }}
+                          className="rounded-full bg-white/20 p-2 text-sm transition-all hover:bg-white/30"
+                        >
+                          {isMuted ? 'Unmute' : 'Mute'}
+                        </button>
+                        <div className="text-sm">
+                          {formatTime(currentTime)}
+                        </div>
+                      </div>
+                      <div className="text-sm font-medium">
+                        {watchParty.videoTitle || "YouTube Video"}
+                      </div>
+                      <button
+                        onClick={() => {
+                          const videoContainer = iframeRef.current?.parentElement;
+                          if (videoContainer) {
+                            if (!document.fullscreenElement) {
+                              videoContainer.requestFullscreen().then(() => setIsFullscreen(true));
+                            } else {
+                              document.exitFullscreen().then(() => setIsFullscreen(false));
+                            }
+                          }
+                        }}
+                        className="rounded-full bg-white/20 p-2 text-sm transition-all hover:bg-white/30"
+                      >
+                        {isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-center text-white">
+                  <div className="text-6xl mb-4">Loading video...</div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Right Sidebar - Participants + Chat */}
+        <aside className="hidden md:block w-96 border-l border-white/10 bg-black/20 flex flex-col">
+          {/* Participants Section */}
+          <div className="border-b border-white/10">
+            <div className="p-4">
+              <h2 className="text-lg font-bold text-white mb-2">Participants ({participants.length})</h2>
+            </div>
+            <div className="px-4 pb-4 space-y-3 max-h-48 overflow-y-auto">
+              {participants.length === 0 ? (
+                <div className="text-center text-pink-300 text-sm py-4">
+                  No participants yet. Invite friends to join!
+                </div>
+              ) : (
+                participants.map((participant) => (
+                  <div key={participant.user._id} className="flex items-center gap-3">
+                    <img
+                      src={participant.user.avatar || `https://ui-avatars.com/api/?name=${participant.user.username}&background=random`}
+                      alt=""
+                      className="h-8 w-8 rounded-full"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-semibold text-white">
+                        {participant.user.username}
+                        {participant.user._id === user._id && " (You)"}
+                      </p>
+                      <p className="text-xs text-pink-400">
+                        Joined {new Date(participant.joinedAt).toLocaleTimeString()}
+                      </p>
+                    </div>
+                    {participant.user._id === watchParty?.host?._id && (
+                      <span className="rounded-full bg-gradient-to-r from-pink-600 to-purple-600 px-2 py-1 text-xs font-medium text-white">
+                        HOST
+                      </span>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Chat Section */}
+          <div className="flex-1 flex flex-col">
+            <div className="p-4 border-b border-white/10">
+              <h2 className="text-lg font-bold text-white">Live Chat</h2>
+            </div>
+            
+            {/* Messages */}
+            <div 
+              ref={chatContainerRef}
+              className="flex-1 overflow-y-auto p-4 space-y-3 scroll-smooth" 
+              id="chat-messages-container"
+              style={{ scrollBehavior: 'smooth' }}
+            >
+              {chatMessages.length === 0 ? (
+                <div className="text-center text-pink-300 text-sm">
+                  No messages yet. Start the conversation!
+                </div>
+              ) : (
+                chatMessages.map((msg, index) => (
+                  <div key={index} className="flex gap-3">
+                    <img
+                      src={`https://ui-avatars.com/api/?name=${msg.username}&background=random`}
+                      alt=""
+                      className="h-8 w-8 rounded-full flex-shrink-0"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-semibold text-white">{msg.username}</p>
+                      <p className="text-sm text-pink-200 break-words">{msg.message}</p>
+                      <p className="text-xs text-pink-400">
+                        {new Date(msg.timestamp).toLocaleTimeString()}
+                      </p>
+                    </div>
+                  </div>
+                ))
+              )}
+              <div ref={chatEndRef} />
+            </div>
+            
+            {/* Chat Input */}
+            <div className="border-t border-white/10 p-4">
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  placeholder="Type a message..."
+                  className="flex-1 rounded-full bg-white/10 px-4 py-2 text-white placeholder-white/50 outline-none ring-pink-500/30 transition-all focus:ring-2 focus:bg-white/20 text-sm"
+                  onKeyPress={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      handleSendMessage();
+                    }
+                  }}
+                />
+                <button
+                  onClick={handleSendMessage}
+                  disabled={!chatInput.trim()}
+                  className="rounded-full bg-gradient-to-r from-pink-600 to-purple-600 px-4 py-2 text-sm font-semibold text-white transition-all hover:from-pink-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Send
+                </button>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      {/* Invite Modal */}
+      {showInviteModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-3xl bg-white p-8 shadow-2xl">
+            <h2 className="text-2xl font-bold text-slate-900 mb-6">Invite Friends</h2>
+            
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-2">
+                  Room Code
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={roomId}
+                    readOnly
+                    className="flex-1 rounded-2xl border border-slate-200/60 px-4 py-3 text-slate-900 bg-slate-50 font-mono text-center text-lg"
+                  />
+                  <button
+                    onClick={handleCopyRoomCode}
+                    className="rounded-2xl bg-gradient-to-r from-pink-600 to-purple-600 px-4 py-3 font-semibold text-white transition-all hover:from-pink-500 hover:to-purple-500"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-2">
+                  Invite Link
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={`${window.location.origin}/rave/${roomId}`}
+                    readOnly
+                    className="flex-1 rounded-2xl border border-slate-200/60 px-4 py-3 text-slate-900 bg-slate-50 text-xs"
+                  />
+                  <button
+                    onClick={handleCopyInvite}
+                    className="rounded-2xl bg-gradient-to-r from-pink-600 to-purple-600 px-4 py-3 font-semibold text-white transition-all hover:from-pink-500 hover:to-purple-500"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-2">
+                  Share via
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    onClick={handleWhatsAppShare}
+                    className="rounded-2xl bg-green-600 px-4 py-3 font-semibold text-white transition-all hover:bg-green-500"
+                  >
+                    WhatsApp
+                  </button>
+                  <button
+                    onClick={handleTelegramShare}
+                    className="rounded-2xl bg-blue-600 px-4 py-3 font-semibold text-white transition-all hover:bg-blue-500"
+                  >
+                    Telegram
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-6 flex gap-3">
+              <button
+                onClick={() => setShowInviteModal(false)}
+                className="flex-1 rounded-2xl border border-slate-200/60 py-3 font-semibold text-slate-600 transition-all hover:bg-slate-50"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Privacy Modal */}
+      {showPrivacyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-3xl bg-white p-8 shadow-2xl">
+            <h2 className="text-2xl font-bold text-slate-900 mb-6">Privacy Settings</h2>
+            
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-2">
+                  Room Type
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    onClick={() => setIsPublic(true)}
+                    className={`rounded-2xl px-4 py-3 font-semibold transition-all ${
+                      isPublic 
+                        ? 'bg-green-600 text-white' 
+                        : 'border border-slate-200/60 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    Public
+                  </button>
+                  <button
+                    onClick={() => setIsPublic(false)}
+                    className={`rounded-2xl px-4 py-3 font-semibold transition-all ${
+                      !isPublic 
+                        ? 'bg-red-600 text-white' 
+                        : 'border border-slate-200/60 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    Private
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-6 flex gap-3">
+              <button
+                onClick={() => setShowPrivacyModal(false)}
+                className="flex-1 rounded-2xl border border-slate-200/60 py-3 font-semibold text-slate-600 transition-all hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleUpdatePrivacy}
+                disabled={!isHost}
+                className="flex-1 rounded-2xl bg-gradient-to-r from-pink-600 to-purple-600 py-3 font-semibold text-white transition-all hover:from-pink-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isHost ? 'Update' : 'Only Host Can Change'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Error Message */}
+      {error && (
+        <div className="fixed top-4 right-4 z-50 rounded-2xl bg-pink-600/90 px-6 py-4 text-white text-sm shadow-lg backdrop-blur-sm">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
